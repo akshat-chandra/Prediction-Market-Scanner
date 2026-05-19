@@ -69,10 +69,11 @@ def write_signal(row: dict):
 
 
 def update_resolution(event: str, signal_type: str, entry_ts: str,
-                      resolution: str, pnl: float, closing_line: float):
+                      resolution: str, pnl: float, closing_line: float | None):
     """
     Write resolution + P&L back to the original signal row in the CSV.
     Matches on (event, signal_type, timestamp). Only updates unresolved rows.
+    closing_line: pre-game mid snapshot in decimal (e.g. 0.58), or None if not captured.
     """
     if not os.path.exists(LOG_FILE):
         return
@@ -87,7 +88,7 @@ def update_resolution(event: str, signal_type: str, entry_ts: str,
                     and not r.get("resolution")):
                 r["resolution"] = resolution
                 r["pnl"] = f"{pnl:.4f}"
-                r["closing_line_at_entry"] = f"{closing_line:.4f}"
+                r["closing_line_at_entry"] = f"{closing_line:.4f}" if closing_line is not None else ""
                 updated = True
             rows.append(r)
     if updated:
@@ -300,10 +301,11 @@ class PaperTradeTracker:
               f"| {row.get('event','')[:40]} | {row.get('action','')[:60]}")
 
     @classmethod
-    def resolve(cls, event: str, yes_settles: bool, closing_mid_cents: float):
+    def resolve(cls, event: str, yes_settles: bool, closing_line_cents: float | None):
         """
         Call when a market settles. Computes simulated P&L for all open paper
         trades on that event and writes resolution back to the CSV.
+        closing_line_cents: pre-game mid snapshot in cents, or None if not captured.
         """
         to_close = [(k, v) for k, v in list(cls._open.items()) if k[0] == event]
         for key, trade in to_close:
@@ -320,13 +322,16 @@ class PaperTradeTracker:
                 pnl = (settle_price - ep) * contracts / 100
 
             resolution = "YES" if yes_settles else "NO"
+            closing_line = closing_line_cents / 100 if closing_line_cents is not None else None
             update_resolution(
                 event=key[0], signal_type=key[1], entry_ts=key[2],
                 resolution=resolution, pnl=pnl,
-                closing_line=closing_mid_cents / 100,
+                closing_line=closing_line,
             )
             del cls._open[key]
-            print(f"  [RESOLVED] {event} → {resolution} | Paper P&L: ${pnl:+.2f}")
+            clv_str = (f" | CLV: {closing_line - ep/100:+.4f}"
+                       if closing_line is not None else " | CLV: no snapshot")
+            print(f"  [RESOLVED] {event} → {resolution} | Paper P&L: ${pnl:+.2f}{clv_str}")
 
 
 # ── Microstructure signal checker ──────────────────────────────────────────
@@ -1024,11 +1029,62 @@ def rest_scan_upcoming(pairs: list[dict], kalshi: KalshiClient,
             print(f"  REST scan error [{name}]: {e}")
 
 
+def snapshot_closing_lines(registry: GameRegistry, kalshi: KalshiClient,
+                            poly: PolymarketClient):
+    """
+    For upcoming games within 5 minutes of tip-off, snapshot the current mid price
+    as the true closing line for CLV tracking. Only snapshots once per game.
+    CLV = closing_line_snapshot - entry_price. Settlement (100/0) is not the closing line.
+    """
+    from datetime import timedelta
+    now = datetime.now(timezone.utc)
+
+    for g in registry.upcoming_games():
+        name = g["name"]
+        if registry.games[name].get("closing_line_snapshot") is not None:
+            continue  # already captured
+
+        gst = GameRegistry._parse_gst(g.get("game_start_time"))
+        if gst is None:
+            continue
+
+        mins_to_start = (gst - now).total_seconds() / 60
+        if not (0 < mins_to_start <= 5):
+            continue
+
+        ticker   = g.get("kalshi_ticker")
+        token_id = g.get("poly_token_id")
+        if not ticker or not token_id:
+            continue
+
+        try:
+            mids = []
+            kp = with_backoff(lambda t=ticker: kalshi.get_market_price(t))
+            if kp and kp.get("mid_cents"):
+                mids.append(float(kp["mid_cents"]))
+
+            clob = with_backoff(lambda t=token_id: poly.get_orderbook(t))
+            if clob and not clob.get("error"):
+                p_book = PolyLocalBook(token_id)
+                p_book.apply_snapshot(clob.get("bids", []), clob.get("asks", []))
+                if p_book.mid() is not None:
+                    mids.append(p_book.mid())
+
+            if mids:
+                snapshot = sum(mids) / len(mids)
+                registry.update(name, closing_line_snapshot=snapshot)
+                print(f"  [CLV] Closing line snapshot for {name[:40]}: "
+                      f"{snapshot:.1f}¢ ({mins_to_start:.1f} min to tip-off)")
+        except Exception as e:
+            print(f"  [CLV] Snapshot error [{name}]: {e}")
+
+
 def check_settlements(registry: GameRegistry, kalshi: KalshiClient):
     """
     Poll Kalshi for settlement status of known live games.
     A market is settled when yes_bid > 95¢ (YES wins) or < 5¢ (NO wins).
     Calls PaperTradeTracker.resolve() to finalize simulated P&L.
+    closing_line passed is the pre-game snapshot (true CLV denominator), not settlement price.
     """
     for g in registry.live_games():
         ticker = g.get("kalshi_ticker")
@@ -1039,14 +1095,14 @@ def check_settlements(registry: GameRegistry, kalshi: KalshiClient):
             if not price:
                 continue
             bid = price.get("yes_bid", 50)
-            mid = price.get("mid_cents", 50)
+            closing_line = registry.games[g["name"]].get("closing_line_snapshot")
             if bid is not None and bid > 95:
                 PaperTradeTracker.resolve(g["name"], yes_settles=True,
-                                          closing_mid_cents=float(mid or bid))
+                                          closing_line_cents=closing_line)
                 del registry.games[g["name"]]
             elif bid is not None and bid < 5:
                 PaperTradeTracker.resolve(g["name"], yes_settles=False,
-                                          closing_mid_cents=float(mid or bid))
+                                          closing_line_cents=closing_line)
                 del registry.games[g["name"]]
         except Exception:
             pass
@@ -1177,6 +1233,12 @@ class Scanner:
                     lambda up=upcoming_pairs:
                         rest_scan_upcoming(up, self.kalshi, self.poly, self.checker)
                 )
+
+            # Closing line snapshots for pre-game markets within 5 min of tip-off
+            await loop.run_in_executor(
+                None,
+                lambda: snapshot_closing_lines(self.registry, self.kalshi, self.poly)
+            )
 
             # Periodic settlement check
             if now - last_settlement_check >= self.SETTLEMENT_INTERVAL:
